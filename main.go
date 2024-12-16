@@ -195,29 +195,11 @@ func parseNamedAttribute(pkg *packages.Package, expr *ast.ValueSpec) *NamedAttri
 func ExternalRefs(info *PkgInfo, files []*ast.File) map[SymbolName]AttributeName {
 	refs := make(map[SymbolName]AttributeName)
 	for _, f := range files {
-		for name, key := range externalVarsInFile(info, f) {
-			refs[name] = key
+		for named := range syntax.Search(f, info.MatchAttribute) {
+			refs[named.Name] = named.Key
 		}
 	}
 	return refs
-}
-
-func externalVarsInFile(info *PkgInfo, f *ast.File) iter.Seq2[SymbolName, AttributeName] {
-	return func(yield func(SymbolName, AttributeName) bool) {
-		for n := range ast.Preorder(f) {
-			x, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				continue
-			}
-			name, key, ok := info.MatchAttribute(x)
-			if !ok {
-				continue
-			}
-			if !yield(name, key) {
-				break
-			}
-		}
-	}
 }
 
 type PkgInfo struct {
@@ -225,21 +207,24 @@ type PkgInfo struct {
 	Attrs map[string]map[SymbolName]AttributeName
 }
 
-func (info *PkgInfo) MatchAttribute(expr *ast.SelectorExpr) (SymbolName, AttributeName, bool) {
+func (info *PkgInfo) MatchAttribute(expr *ast.SelectorExpr) (*NamedAttribute, bool) {
 	p, ok := expr.X.(*ast.Ident)
 	if !ok {
-		return "", "", false
+		return nil, false
 	}
 
 	pkg, ok := info.Info.Uses[p].(*types.PkgName)
 	if !ok {
-		return "", "", false
+		return nil, false
 	}
 	m, ok := info.Attrs[pkg.Name()]
 	if !ok {
-		return "", "", false
+		return nil, false
 	}
 
 	name := SymbolName(expr.Sel.Name)
-	return name, m[name], true
+	return &NamedAttribute{
+		Name: SymbolName(name),
+		Key:  AttributeName(m[name]),
+	}, true
 }
