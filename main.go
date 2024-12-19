@@ -8,15 +8,18 @@ import (
 	"iter"
 	"log"
 	"maps"
+	"path"
 	"slices"
-	"strings"
 
 	"golang.org/x/tools/go/packages"
 
 	"github.com/mackerelio-labs/semconv/syntax"
 )
 
-const packagePrefix = "go.opentelemetry.io/otel/semconv/"
+const (
+	packagePattern      = "go.opentelemetry.io/otel/semconv/v*"
+	otherPackagePattern = "go.opentelemetry.io/otel/semconv/v*/*"
+)
 
 var (
 	debugFlag = flag.Bool("debug", false, "enables debug print")
@@ -30,11 +33,23 @@ func main() {
 	for _, pkgPath := range flag.Args() {
 		for pkg := range Packages(pkgPath) {
 			attrs := make(map[string]map[SymbolName]AttributeName)
-			for _, sem := range ImportedPackages(pkg.Imports, packagePrefix) {
-				attrs[sem.Name] = CollectAttributes(sem)
+			patterns := []string{packagePattern, otherPackagePattern}
+			var imp Importer
+			pkgs := GroupBy(imp.ImportedPackages(pkg.Imports), patterns)
+			for _, sem := range pkgs[packagePattern] {
+				attrs[sem.PkgPath] = CollectAttributes(sem)
 				if *debugFlag {
-					log.Printf("attribute %s %v\n", sem.Name, attrs[sem.Name])
+					log.Printf("attribute %s %v\n", sem.PkgPath, attrs[sem.PkgPath])
 				}
+			}
+			// We expect two special packages here: httpconv and netconv.
+			for _, conv := range pkgs[otherPackagePattern] {
+				pi := &PkgInfo{
+					Info:  conv.TypesInfo,
+					Attrs: attrs,
+				}
+				refs := ExternalRefs(pi, conv.Syntax)
+				attrs[conv.PkgPath] = make(map[SymbolName]AttributeName)
 			}
 			info := &PkgInfo{
 				Info:  pkg.TypesInfo,
@@ -71,23 +86,52 @@ func Packages(pkgPath string) iter.Seq[*packages.Package] {
 	}
 }
 
+type Importer struct {
+	cache map[string]struct{}
+}
+
 // ImportedPackages returns some packages matched by pattern.
-// If pattern ends with "/", it behaves as a prefix.
-func ImportedPackages(imports map[string]*packages.Package, pattern string) iter.Seq2[string, *packages.Package] {
-	return func(yield func(string, *packages.Package) bool) {
-		for name, pkg := range imports {
-			switch {
-			case strings.HasSuffix(pattern, "/"):
-				if strings.HasPrefix(pkg.PkgPath, pattern) && !yield(name, pkg) {
-					return
+func (imp *Importer) ImportedPackages(imports map[string]*packages.Package) iter.Seq[*packages.Package] {
+	if imp.cache == nil {
+		imp.cache = make(map[string]struct{})
+	}
+	return func(yield func(*packages.Package) bool) {
+		for _, pkg := range imports {
+			_, ok := imp.cache[pkg.PkgPath]
+			if !ok {
+				for p := range imp.ImportedPackages(pkg.Imports) {
+					if !yield(p) {
+						return
+					}
 				}
-			default:
-				if pkg.PkgPath == pattern && !yield(name, pkg) {
-					return
-				}
+				imp.cache[pkg.PkgPath] = struct{}{}
+			}
+			if !yield(pkg) {
+				return
 			}
 		}
 	}
+}
+
+// GroupBy classifies pkgs into appropriate patterns by package path.
+// If there are duplicated packages, they don't keep in result except the first one.
+//
+// Pattern is exactly same as [path.Match].
+func GroupBy(pkgs iter.Seq[*packages.Package], patterns []string) map[string][]*packages.Package {
+	m := make(map[string][]*packages.Package)
+	for pkg := range Uniq(pkgs) {
+		for _, pattern := range patterns {
+			ok, err := path.Match(pattern, pkg.PkgPath)
+			if err != nil {
+				log.Fatalf("failed to match %s: %v\n", pkg.PkgPath, err)
+			}
+			if ok {
+				m[pattern] = append(m[pattern], pkg)
+				break
+			}
+		}
+	}
+	return m
 }
 
 // Name represents the name of the constants, variables or functions in the semconv package.
@@ -192,11 +236,11 @@ func parseNamedAttribute(pkg *packages.Package, expr *ast.ValueSpec) *NamedAttri
 	}
 }
 
-func ExternalRefs(info *PkgInfo, files []*ast.File) map[SymbolName]AttributeName {
-	refs := make(map[SymbolName]AttributeName)
+func ExternalRefs(info *PkgInfo, files []*ast.File) map[SymbolName][]AttributeName {
+	refs := make(map[SymbolName][]AttributeName)
 	for _, f := range files {
 		for named := range syntax.Search(f, info.MatchAttribute) {
-			refs[named.Name] = named.Key
+			refs[named.Name] = append(refs[named.Name], named.Key)
 		}
 	}
 	return refs
@@ -217,14 +261,19 @@ func (info *PkgInfo) MatchAttribute(expr *ast.SelectorExpr) (*NamedAttribute, bo
 	if !ok {
 		return nil, false
 	}
-	m, ok := info.Attrs[pkg.Name()]
+	pkgPath := pkg.Pkg().Path()
+	m, ok := info.Attrs[pkgPath]
 	if !ok {
 		return nil, false
 	}
 
 	name := SymbolName(expr.Sel.Name)
+	key, ok := m[name]
+	if !ok {
+		log.Printf("%s.%s is not exist\n", pkgPath, name)
+	}
 	return &NamedAttribute{
 		Name: SymbolName(name),
-		Key:  AttributeName(m[name]),
+		Key:  key,
 	}, true
 }
